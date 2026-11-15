@@ -6,7 +6,7 @@
 
 <p align="center">
   A free focus timer for Windows that gently pulls you back when you drift.<br>
-  Built by a someone with ADHD, for all who study.
+  Built by someone with ADHD, for all who study.
 </p>
 
 <p align="center">
