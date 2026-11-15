@@ -5,8 +5,8 @@
 <h1 align="center">StudyGuard</h1>
 
 <p align="center">
-  A free, private focus timer for Windows that gently pulls you back when you drift.<br>
-  Built by a medical student with ADHD, for anyone who studies.
+  A free focus timer for Windows that gently pulls you back when you drift.<br>
+  Built by a someone with ADHD, for all who study.
 </p>
 
 <p align="center">
