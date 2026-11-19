@@ -9,6 +9,8 @@ top of everything telling you to get back to studying.
 Features
   - Focus timer ring with 5-minute breaks (up to 4 per rolling hour)
   - Strict mode: anything that is not a study app counts as a distraction
+  - Block mode (Windows): closes distracting browser tabs and apps while the
+    timer is running, instead of only reminding you
   - Session checklist: small steps, with a "Now:" prompt on the Focus tab
   - Distraction parking lot: multiple tabs, export to .txt
   - Exam countdown, daily study goal and streak
@@ -59,6 +61,7 @@ DEFAULTS = {
     ],
     "allowed": ["lecture", "tutorial", "course", "khan academy", "study", "notes"],
     "strict": False,
+    "block": False,               # block mode: close distracting tabs/apps during a session
     "strict_apps": [
         "studyguard", "anki", "pdf", "word", "powerpoint", "onenote",
         "notion", "obsidian", "zotero", "kindle", "acrobat", "preview", "pages",
@@ -247,6 +250,189 @@ def open_folder(path):
             subprocess.Popen(["xdg-open", path])
     except Exception as ex:
         messagebox.showinfo("Report folder", f"Your reports are in:\n{path}\n\n({ex})")
+
+
+# --------------------------------------------------------------------------
+# Block mode (Windows only, no third-party packages)
+#
+# While a session is running StudyGuard can close distractions instead of only
+# nagging about them:
+#   - browser tabs: only the tab you are looking at can be seen (its title), so
+#     a distracting tab is closed with Ctrl+W as soon as it is the active tab
+#   - apps: any open window whose app name or program name is on the
+#     distraction list is asked to close (WM_CLOSE, so it can still prompt to
+#     save). Apps are never closed just because strict mode is on.
+# --------------------------------------------------------------------------
+BLOCK_SUPPORTED = platform.system() == "Windows"
+BLOCK_GRACE = 3               # seconds a distracting tab may stay in front before it is closed
+BLOCK_RETRY = 10              # seconds before the same app window is asked to close again
+BROWSER_EXES = {
+    "chrome", "msedge", "firefox", "brave", "opera", "opera_gx", "vivaldi", "arc", "zen",
+    "chromium", "librewolf", "waterfox", "thorium", "iexplore",
+}
+NEW_TAB_TITLES = {
+    "new tab", "new incognito tab", "new private tab", "new inprivate tab", "private browsing",
+    "start page", "speed dial", "about:blank", "untitled", "blank page",
+}
+_WINAPI = None
+
+
+def _winapi():
+    """user32/kernel32 with proper prototypes (handles are 64-bit on 64-bit Windows)."""
+    global _WINAPI
+    if _WINAPI is None:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        u.GetForegroundWindow.restype = wintypes.HWND
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        u.GetWindowThreadProcessId.restype = wintypes.DWORD
+        u.IsWindowVisible.argtypes = [wintypes.HWND]
+        u.EnumWindows.argtypes = [enum_proc, wintypes.LPARAM]
+        u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        u.GetAsyncKeyState.restype = ctypes.c_short
+        u.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t]
+        u.keybd_event.restype = None
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        _WINAPI = (u, k, enum_proc)
+    return _WINAPI
+
+
+def _window_title(hwnd):
+    import ctypes
+    u = _winapi()[0]
+    length = u.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    u.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value or ""
+
+
+def _window_process(hwnd):
+    """(pid, program name) of a window, e.g. (1234, "chrome"). Name is "" if it can't be read."""
+    import ctypes
+    from ctypes import wintypes
+    u, k, _ = _winapi()
+    pid = wintypes.DWORD(0)
+    u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    name = ""
+    handle = k.OpenProcess(0x1000, False, pid.value)      # PROCESS_QUERY_LIMITED_INFORMATION
+    if handle:
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if k.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                name = os.path.splitext(os.path.basename(buf.value))[0].lower()
+        finally:
+            k.CloseHandle(handle)
+    return pid.value, name
+
+
+def foreground_window():
+    """(hwnd, title, program name) of the window in front, or (None, "", "")."""
+    if not BLOCK_SUPPORTED:
+        return None, "", ""
+    try:
+        hwnd = _winapi()[0].GetForegroundWindow()
+        if not hwnd:
+            return None, "", ""
+        return hwnd, _window_title(hwnd), _window_process(hwnd)[1]
+    except Exception:
+        return None, "", ""
+
+
+def is_browser(exe, title):
+    if exe:
+        return exe in BROWSER_EXES
+    return describe_window(title)[0] in BROWSERS.values()     # program name unreadable: go by title
+
+
+def is_new_tab(title):
+    """An empty/new tab, which must stay open so you can still navigate somewhere."""
+    app, label = describe_window(title)
+    return not label or label == app or label.lower() in NEW_TAB_TITLES
+
+
+def app_is_blocked(title, exe, dist, allow):
+    """True if a (non-browser) window belongs to an app on the distraction list.
+
+    Only the app's own name (the last part of its title) and its program name are checked,
+    so a document that merely mentions a distracting word is left alone."""
+    t = (title or "").lower()
+    if any(a in t for a in allow):
+        return False
+    name = f"{describe_window(title)[0]} {exe or ''}".lower()
+    return any(d in name for d in dist)
+
+
+def close_active_tab(hwnd):
+    """Send Ctrl+W to the browser window in front. Returns True if the keys were sent."""
+    if not BLOCK_SUPPORTED:
+        return False
+    try:
+        u = _winapi()[0]
+        if u.GetForegroundWindow() != hwnd:
+            return False
+        # Shift/Alt/Win held down would turn Ctrl+W into something else (Ctrl+Shift+W closes
+        # the whole browser window), so wait for the next second instead.
+        if any(u.GetAsyncKeyState(vk) & 0x8000 for vk in (0x10, 0x12, 0x5B, 0x5C)):
+            return False
+        VK_CONTROL, VK_W, KEYUP = 0x11, 0x57, 0x0002
+        u.keybd_event(VK_CONTROL, 0, 0, 0)
+        u.keybd_event(VK_W, 0, 0, 0)
+        u.keybd_event(VK_W, 0, KEYUP, 0)
+        u.keybd_event(VK_CONTROL, 0, KEYUP, 0)
+        return True
+    except Exception:
+        return False
+
+
+def close_blocked_apps(dist, allow, recent):
+    """Ask every open window of a distracting app to close. Returns the names closed.
+
+    recent: dict of hwnd -> time it was last asked, so a window showing a "save changes?"
+    prompt is not asked again every tick."""
+    closed = []
+    if not BLOCK_SUPPORTED:
+        return closed
+    try:
+        u, _, enum_proc = _winapi()
+        hwnds = []
+
+        def collect(hwnd, lparam):
+            hwnds.append(hwnd)
+            return True
+        u.EnumWindows(enum_proc(collect), 0)
+        me, now = os.getpid(), time.time()
+        for hwnd in hwnds:
+            if not u.IsWindowVisible(hwnd):
+                continue
+            title = _window_title(hwnd)
+            if not title:
+                continue
+            pid, exe = _window_process(hwnd)
+            if pid == me or is_browser(exe, title) or not app_is_blocked(title, exe, dist, allow):
+                continue
+            if now - recent.get(hwnd, 0) < BLOCK_RETRY:
+                continue
+            recent[hwnd] = now
+            u.PostMessageW(hwnd, 0x0010, 0, 0)            # WM_CLOSE
+            closed.append(describe_window(title)[1])
+        for hwnd in [h for h, t in recent.items() if now - t > 600]:
+            del recent[hwnd]
+    except Exception:
+        pass
+    return closed
 
 
 # --------------------------------------------------------------------------
@@ -1026,6 +1212,10 @@ class StudyGuard:
         self.last_active = 0.0
         self.sec_n = 0                # every second, session or not
         self.idle_secs = 0.0
+        self.block_hwnd = None        # browser window currently showing a distracting tab
+        self.block_run = 0            # ...and for how many seconds
+        self.block_count = 0          # tabs/apps closed this session
+        self.block_recent = {}        # app windows recently asked to close
         self.tracker = UsageTracker(self.cfg)
         self.top_var = tk.BooleanVar(value=bool(self.cfg["always_on_top"]))
 
@@ -1240,6 +1430,10 @@ class StudyGuard:
         ttk.Label(lenrow, text="minutes", style="CardMuted.TLabel").pack(side="left", padx=(8, 0))
         self.strict_var = tk.BooleanVar(value=self.cfg["strict"])
         Toggle(setup, "Strict", self.strict_var, command=self.on_strict, bg=CARD).grid(row=2, column=1, sticky="e")
+        self.block_var = tk.BooleanVar(value=bool(self.cfg.get("block")) and BLOCK_SUPPORTED)
+        if BLOCK_SUPPORTED:
+            Toggle(setup, "Block distracting tabs and apps", self.block_var, command=self.on_block,
+                   bg=CARD).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         stats = self.card(right)
         ttk.Label(stats, text=caps("Session"), style="CardCaps.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
@@ -1567,7 +1761,9 @@ class StudyGuard:
             lists, style="CardMuted.TLabel", wraplength=660, justify="left",
             text="One word per line. A window counts as a distraction if its title contains a distracting "
                  "word, unless it also has an “Always OK” word (e.g. a YouTube lecture). In strict "
-                 "mode, any window without a study-app or “Always OK” word counts as a distraction.",
+                 "mode, any window without a study-app or “Always OK” word counts as a distraction. "
+                 "With blocking on (Focus page), a distracting browser tab is closed after a few seconds "
+                 "and apps on the Distracting list are closed while the timer runs.",
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
     def set_theme(self, key):
@@ -2113,6 +2309,7 @@ class StudyGuard:
             "allowed": allow,
             "strict_apps": strict_apps,
             "strict": bool(self.strict_var.get()),
+            "block": bool(self.block_var.get()),
             "daily_goal_minutes": self.safe_int(self.dgoal_var, 240),
             "always_on_top": bool(self.top_var.get()),
             "compact_on_start": bool(self.compact_var.get()),
@@ -2129,6 +2326,40 @@ class StudyGuard:
     def on_strict(self):
         self.cfg["strict"] = bool(self.strict_var.get())
         save_json(CFG_PATH, self.cfg)
+
+    def on_block(self):
+        self.cfg["block"] = bool(self.block_var.get())
+        save_json(CFG_PATH, self.cfg)
+        self.block_hwnd, self.block_run = None, 0
+
+    def enforce_block(self):
+        """Block mode: close the distracting tab in front and any open distracting apps."""
+        if not (BLOCK_SUPPORTED and self.block_var.get()):
+            return
+        try:
+            dist, allow, _ = self.read_lists()
+            hwnd, title, exe = foreground_window()
+            if hwnd and is_browser(exe, title) and not is_new_tab(title) and self.is_distraction(title):
+                self.block_run = self.block_run + 1 if hwnd == self.block_hwnd else 1
+                self.block_hwnd = hwnd
+                if self.block_run >= BLOCK_GRACE and close_active_tab(hwnd):
+                    self.block_run = 0
+                    self.on_blocked(describe_window(title)[1])
+            else:
+                self.block_hwnd, self.block_run = None, 0
+            if self.tick_n % 2 == 0:
+                for name in close_blocked_apps(dist, allow, self.block_recent):
+                    self.on_blocked(name)
+        except Exception:
+            pass
+
+    def on_blocked(self, name):
+        self.block_count += 1
+        self.set_status(f"Blocked: {name[:40]}", RED)
+        if self.well_window is None:      # don't replace a wellness reminder that's showing
+            self.popup("Blocked", [(f"{name[:40]} was closed.", "main"),
+                                   (f"Back to: {self.cfg['goal']}", "muted")],
+                       RED, timeout=4000, size=(380, 170), slot="well", tag="Block mode")
 
     def set_status(self, text, color):
         self.status_var.set(text)
@@ -2251,6 +2482,8 @@ class StudyGuard:
         self.persist()
         self.remaining = self.cfg["minutes"] * 60
         self.focused = self.distracted = self.nag_count = self.drift_run = 0
+        self.block_count = self.block_run = 0
+        self.block_hwnd = None
         self.last_nag = 0.0
         self.running, self.paused = True, False
         self.on_break = False
@@ -2352,6 +2585,8 @@ class StudyGuard:
                 f"Reminders: {self.nag_count}",
                 f"Focus score: {pct}%",
             ]
+            if self.block_count:
+                lines.append(f"Blocked: {self.block_count} tabs/apps closed")
             if items:
                 lines.append(f"Checklist: {done}/{len(items)} steps done")
             lines.append(f"Daily goal: {fmt_hm(today)} of {fmt_hm(goal)} "
@@ -2404,6 +2639,7 @@ class StudyGuard:
                     self.notice("Daily goal reached!",
                                 f"You've focused for {fmt_hm(self.today_total())} today. Brilliant.")
 
+            self.enforce_block()
             self.update_stats()
             if self.remaining <= 0:
                 self.stop(finished=True)

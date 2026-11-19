@@ -20,6 +20,7 @@
 
 - **Focus timer:** start a session and StudyGuard watches which window you're using. Drift to YouTube, Reddit or TikTok for too long and a pop-up nudges you back to work.
 - **Strict mode:** anything that isn't a study app counts as a distraction.
+- **Block mode (optional):** switch on "Block distracting tabs and apps" and, while the timer is running, StudyGuard closes a distracting browser tab a few seconds after you open it and closes apps on your Distracting list (Discord, Steam, Spotify…). Combine it with strict mode and only tabs with a study-app or "Always OK" word stay open. It is off during breaks and when paused. StudyGuard can only see the tab you are looking at, so a background tab is closed when you switch to it.
 - **Breaks:** up to four 5-minute breaks per hour, so you rest without losing the whole afternoon.
 - **Session checklist:** break work into small steps; the next one is always shown as "Now".
 - **Parking lot:** jot down stray thoughts in tabs to deal with later, and export them as `.txt`.
